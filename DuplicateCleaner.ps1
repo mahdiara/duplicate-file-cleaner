@@ -3,33 +3,32 @@
     Low-RAM Duplicate File Cleaner for Windows
 
 .DESCRIPTION
-    Finds and removes true duplicate files recursively.
+    Finds true duplicate files recursively.
 
     Duplicate detection:
         1. Files must have the same size.
         2. Files must have the same SHA-256 hash.
 
-    The script uses a disk-backed size index instead of keeping the
-    complete file list in RAM. This makes it suitable for very large
-    collections, including 1TB+ datasets and hundreds of thousands
-    of files.
+    The script uses a disk-backed index instead of keeping the
+    complete file list in RAM. This makes it suitable for very
+    large collections, including 1TB+ datasets.
 
     Features:
         - Recursive scanning
-        - Low RAM usage
+        - Very low RAM usage
         - Disk-backed indexing
         - SHA-256 verification
-        - Exclude folder support
-        - Dry-run mode
+        - Optional excluded folder
+        - Safe dry-run mode
         - Live progress
         - Speed and ETA
         - CSV deletion log
-        - Final verification scan
+        - Final verification
         - Error handling
-        - Temporary-file cleanup
+        - Automatic temporary-file cleanup
 
 .NOTES
-    Version : 1.0.0
+    Version : 1.1.0
     Platform: Windows PowerShell 5.1+ / PowerShell 7+
 #>
 
@@ -54,7 +53,7 @@ $ExcludeFolder = ""
 # ------------------------------------------------------------
 # SAFETY MODE
 # ------------------------------------------------------------
-# $true  = Scan and report only. NO files are deleted.
+# $true  = Scan only. NOTHING will be deleted.
 # $false = Real deletion.
 
 $DryRun = $true
@@ -63,7 +62,7 @@ $DryRun = $true
 # ------------------------------------------------------------
 # LOG FILE
 # ------------------------------------------------------------
-# The deletion log is created next to this script.
+# Created next to this script only if duplicates are found.
 
 $LogFile = Join-Path `
     $PSScriptRoot `
@@ -73,8 +72,6 @@ $LogFile = Join-Path `
 # ------------------------------------------------------------
 # TEMP DIRECTORY
 # ------------------------------------------------------------
-# Temporary index files are created here.
-# They are deleted automatically when the script finishes.
 
 $TempDirectory = Join-Path `
     ([System.IO.Path]::GetTempPath()) `
@@ -164,6 +161,26 @@ function Get-FileHashSafe {
 }
 
 
+function Write-Section {
+
+    param (
+        [string]$Title
+    )
+
+    Write-Host ""
+    Write-Host "============================================================" `
+        -ForegroundColor Cyan
+
+    Write-Host " $Title" `
+        -ForegroundColor Cyan
+
+    Write-Host "============================================================" `
+        -ForegroundColor Cyan
+
+    Write-Host ""
+}
+
+
 # ============================================================
 # VALIDATION
 # ============================================================
@@ -173,11 +190,13 @@ if (-not (Test-Path -LiteralPath $Folder -PathType Container)) {
     Write-Host ""
     Write-Host "ERROR: Main folder does not exist." -ForegroundColor Red
     Write-Host $Folder -ForegroundColor Red
+    Write-Host ""
+
+    Read-Host "Press ENTER to exit"
     exit 1
 }
 
 
-# Resolve main folder to absolute path
 $Folder = (
     Resolve-Path `
         -LiteralPath $Folder `
@@ -200,8 +219,13 @@ if (-not [string]::IsNullOrWhiteSpace($ExcludeFolder)) {
     ) {
 
         Write-Host ""
-        Write-Host "ERROR: Excluded folder does not exist." -ForegroundColor Red
+        Write-Host "ERROR: Excluded folder does not exist." `
+            -ForegroundColor Red
+
         Write-Host $ExcludeFolder -ForegroundColor Red
+        Write-Host ""
+
+        Read-Host "Press ENTER to exit"
         exit 1
     }
 
@@ -225,7 +249,12 @@ $SortExe = Join-Path `
 if (-not (Test-Path -LiteralPath $SortExe)) {
 
     Write-Host ""
-    Write-Host "ERROR: Windows sort.exe was not found." -ForegroundColor Red
+    Write-Host "ERROR: Windows sort.exe was not found." `
+        -ForegroundColor Red
+
+    Write-Host ""
+
+    Read-Host "Press ENTER to exit"
     exit 1
 }
 
@@ -246,15 +275,48 @@ $SortedIndexFile = Join-Path `
 
 
 # ============================================================
-# CREATE TEMP DIRECTORY
+# CLEANUP FUNCTION
 # ============================================================
 
-New-Item `
-    -ItemType Directory `
-    -Path $TempDirectory `
-    -Force `
-    -ErrorAction Stop |
-    Out-Null
+function Remove-TemporaryFiles {
+
+    Remove-Item `
+        -LiteralPath $RawIndexFile `
+        -Force `
+        -ErrorAction SilentlyContinue
+
+    Remove-Item `
+        -LiteralPath $SortedIndexFile `
+        -Force `
+        -ErrorAction SilentlyContinue
+
+    try {
+
+        if (
+            Test-Path `
+                -LiteralPath $TempDirectory `
+                -PathType Container
+        ) {
+
+            $Remaining =
+                Get-ChildItem `
+                    -LiteralPath $TempDirectory `
+                    -Force `
+                    -ErrorAction SilentlyContinue
+
+            if ($null -eq $Remaining) {
+
+                Remove-Item `
+                    -LiteralPath $TempDirectory `
+                    -Force `
+                    -ErrorAction SilentlyContinue
+            }
+        }
+    }
+    catch {
+        # Cleanup failure is non-fatal.
+    }
+}
 
 
 # ============================================================
@@ -265,11 +327,9 @@ Clear-Host
 
 $ScriptStart = Get-Date
 
-Write-Host ""
-Write-Host "============================================================" -ForegroundColor Cyan
-Write-Host "              DUPLICATE FILE CLEANER" -ForegroundColor Cyan
-Write-Host "============================================================" -ForegroundColor Cyan
-Write-Host ""
+
+Write-Section "DUPLICATE FILE CLEANER"
+
 
 Write-Host "Main folder : $Folder"
 
@@ -280,7 +340,8 @@ if ([string]::IsNullOrWhiteSpace($ExcludeFolder)) {
 }
 else {
 
-    Write-Host "Excluded    : $ExcludeFolder" -ForegroundColor Yellow
+    Write-Host "Excluded    : $ExcludeFolder" `
+        -ForegroundColor Yellow
 }
 
 
@@ -311,22 +372,47 @@ $ScanErrors = 0
 
 
 # ============================================================
-# STEP 1
-# STREAM FILES INTO DISK-BACKED INDEX
+# CREATE TEMP DIRECTORY
 # ============================================================
 
-Write-Host "[1/4] Scanning files..." -ForegroundColor Yellow
-Write-Host "      Building disk-backed index..." -ForegroundColor DarkGray
+try {
+
+    New-Item `
+        -ItemType Directory `
+        -Path $TempDirectory `
+        -Force `
+        -ErrorAction Stop |
+        Out-Null
+
+}
+catch {
+
+    Write-Host ""
+    Write-Host "ERROR: Could not create temporary directory." `
+        -ForegroundColor Red
+
+    Read-Host "Press ENTER to exit"
+    exit 1
+}
+
+
+# ============================================================
+# STEP 1
+# SCAN FILES
+# ============================================================
+
+Write-Host "[1/4] Scanning files..." `
+    -ForegroundColor Yellow
+
+Write-Host "      Building disk-backed index..." `
+    -ForegroundColor DarkGray
+
 Write-Host ""
 
 
 $ScanStart = Get-Date
 $LastUpdate = $ScanStart
 
-
-# ------------------------------------------------------------
-# StreamWriter
-# ------------------------------------------------------------
 
 $Writer = New-Object `
     System.IO.StreamWriter(
@@ -349,10 +435,6 @@ try {
         $File = $_
 
 
-        # ----------------------------------------------------
-        # Exclude
-        # ----------------------------------------------------
-
         if (Test-IsExcluded $File.FullName) {
 
             $ExcludedFiles++
@@ -360,22 +442,14 @@ try {
         }
 
 
-        # ----------------------------------------------------
-        # File counters
-        # ----------------------------------------------------
-
         $FilesScanned++
         $TotalSizeBefore += $File.Length
 
 
-        # ----------------------------------------------------
-        # Fixed-width size prefix
-        #
-        # 20 digits supports files up to ~9.9 EB.
+        # Fixed-width 20-digit size prefix.
         #
         # Example:
         # 00000000000052428800    D:\folder\file.mp4
-        # ----------------------------------------------------
 
         $Line = "{0:D20}`t{1}" -f `
             $File.Length,
@@ -385,9 +459,7 @@ try {
         $Writer.WriteLine($Line)
 
 
-        # ----------------------------------------------------
         # Live status every 2 seconds
-        # ----------------------------------------------------
 
         $Now = Get-Date
 
@@ -441,32 +513,35 @@ finally {
 Write-Host ""
 Write-Host ""
 
-Write-Host "Scan complete." -ForegroundColor Green
+Write-Host "Scan complete." `
+    -ForegroundColor Green
 
 Write-Host ""
+
 Write-Host "Files scanned : $FilesScanned"
 Write-Host "Total size    : $(Format-Size $TotalSizeBefore)"
 Write-Host "Excluded      : $ExcludedFiles"
 Write-Host "Scan errors   : $ScanErrors"
+
 Write-Host ""
 
 
 # ============================================================
 # STEP 2
-# SORT INDEX ON DISK
+# SORT INDEX
 # ============================================================
 
-Write-Host "[2/4] Sorting size index..." -ForegroundColor Yellow
-Write-Host "      Sorting is performed on disk." -ForegroundColor DarkGray
+Write-Host "[2/4] Sorting size index..." `
+    -ForegroundColor Yellow
+
+Write-Host "      Sorting is performed on disk." `
+    -ForegroundColor DarkGray
+
 Write-Host ""
 
 
 $SortStart = Get-Date
 
-
-# Windows sort.exe sorts text lexicographically.
-# Because file sizes have a fixed 20-digit prefix,
-# lexicographical sorting produces numeric size ordering.
 
 & $SortExe `
     $RawIndexFile `
@@ -487,11 +562,9 @@ if ($SortExitCode -ne 0) {
     Write-Host "Sort exit code: $SortExitCode" `
         -ForegroundColor Red
 
-    Remove-Item `
-        -LiteralPath $RawIndexFile `
-        -Force `
-        -ErrorAction SilentlyContinue
+    Remove-TemporaryFiles
 
+    Read-Host "Press ENTER to exit"
     exit 1
 }
 
@@ -505,21 +578,26 @@ Remove-Item `
     -ErrorAction SilentlyContinue
 
 
-Write-Host "Sort complete." -ForegroundColor Green
+Write-Host "Sort complete." `
+    -ForegroundColor Green
+
 Write-Host "Sort time: $([math]::Round($SortTime.TotalMinutes, 1)) minutes"
+
 Write-Host ""
 
 
 # ============================================================
 # STEP 3
-# STREAM SORTED INDEX + HASH DUPLICATES
+# FIND TRUE DUPLICATES
 # ============================================================
 
-Write-Host "[3/4] Checking duplicate contents..." -ForegroundColor Yellow
+Write-Host "[3/4] Checking duplicate contents..." `
+    -ForegroundColor Yellow
+
 Write-Host "      Same-size files are verified using SHA-256." `
     -ForegroundColor DarkGray
-Write-Host ""
 
+Write-Host ""
 
 
 $CandidateFiles = 0
@@ -537,9 +615,8 @@ $ProcessedCandidates = 0
 
 
 # ------------------------------------------------------------
-# First pass over sorted index to count candidates
-#
-# This does NOT load the index into RAM.
+# First pass:
+# Count same-size candidate groups
 # ------------------------------------------------------------
 
 $Reader = New-Object `
@@ -557,6 +634,10 @@ try {
 
     while (($Line = $Reader.ReadLine()) -ne $null) {
 
+        if ($Line.Length -lt 21) {
+            continue
+        }
+
         $CurrentSize =
             [Int64]$Line.Substring(0, 20)
 
@@ -565,20 +646,19 @@ try {
 
             $PreviousSize = $CurrentSize
             $CurrentGroupCount = 1
-
         }
+
         elseif ($CurrentSize -eq $PreviousSize) {
 
             $CurrentGroupCount++
-
         }
+
         else {
 
             if ($CurrentGroupCount -gt 1) {
 
                 $CandidateGroups++
                 $CandidateFiles += $CurrentGroupCount
-
             }
 
             $PreviousSize = $CurrentSize
@@ -591,7 +671,6 @@ try {
 
         $CandidateGroups++
         $CandidateFiles += $CurrentGroupCount
-
     }
 
 }
@@ -603,265 +682,307 @@ finally {
 
 Write-Host "Candidate groups : $CandidateGroups"
 Write-Host "Candidate files  : $CandidateFiles"
+
 Write-Host ""
 
 
 # ------------------------------------------------------------
-# Second pass: actual hash comparison
+# If there are no candidates, skip hashing completely.
 # ------------------------------------------------------------
 
-$Reader = New-Object `
-    System.IO.StreamReader(
-        $SortedIndexFile,
-        [System.Text.Encoding]::UTF8,
-        $true
-    )
+if ($CandidateFiles -eq 0) {
+
+    Write-Host "No same-size candidate files were found." `
+        -ForegroundColor Green
+
+}
+else {
+
+    # --------------------------------------------------------
+    # Second pass:
+    # SHA-256 comparison
+    # --------------------------------------------------------
+
+    $Reader = New-Object `
+        System.IO.StreamReader(
+            $SortedIndexFile,
+            [System.Text.Encoding]::UTF8,
+            $true
+        )
 
 
-$CurrentSize = $null
+    $CurrentSize = $null
 
-# Hash map exists only for ONE size group at a time.
-$HashMap = @{}
+    # Only one size group exists in memory at a time.
+    $HashMap = @{}
 
-$HashStart = Get-Date
-
-
-try {
-
-    while (($Line = $Reader.ReadLine()) -ne $null) {
+    $HashStart = Get-Date
 
 
-        # ----------------------------------------------------
-        # Parse fixed-width size and path
-        # ----------------------------------------------------
+    try {
 
-        $FileSize =
-            [Int64]$Line.Substring(0, 20)
+        while (($Line = $Reader.ReadLine()) -ne $null) {
 
-        $Path =
-            $Line.Substring(21)
+            if ($Line.Length -lt 21) {
+                continue
+            }
 
 
-        # ----------------------------------------------------
-        # New size group
-        # ----------------------------------------------------
+            $FileSize =
+                [Int64]$Line.Substring(0, 20)
 
-        if (
-            $CurrentSize -ne $null -and
-            $FileSize -ne $CurrentSize
-        ) {
-
-            # Release previous group from RAM
-            $HashMap.Clear()
-
-        }
+            $Path =
+                $Line.Substring(21)
 
 
-        $CurrentSize = $FileSize
+            # ------------------------------------------------
+            # New size group
+            # ------------------------------------------------
+
+            if (
+                $CurrentSize -ne $null -and
+                $FileSize -ne $CurrentSize
+            ) {
+
+                $HashMap.Clear()
+            }
 
 
-        # ----------------------------------------------------
-        # Progress
-        # ----------------------------------------------------
-
-        $ProcessedCandidates++
+            $CurrentSize = $FileSize
 
 
-        if ($CandidateFiles -gt 0) {
+            # ------------------------------------------------
+            # Progress
+            # ------------------------------------------------
+
+            $ProcessedCandidates++
+
 
             $Percent = [math]::Floor(
                 ($ProcessedCandidates / $CandidateFiles) * 100
             )
 
-        }
-        else {
 
-            $Percent = 100
-        }
+            $Elapsed =
+                (Get-Date) - $HashStart
 
 
-        $Elapsed =
-            (Get-Date) - $HashStart
+            if ($Elapsed.TotalSeconds -gt 0) {
 
-
-        if ($Elapsed.TotalSeconds -gt 0) {
-
-            $Speed = [math]::Round(
-                $ProcessedCandidates /
-                $Elapsed.TotalSeconds,
-                1
-            )
-
-        }
-        else {
-
-            $Speed = 0
-        }
-
-
-        if ($Speed -gt 0) {
-
-            $Remaining =
-                $CandidateFiles -
-                $ProcessedCandidates
-
-            $ETASeconds =
-                $Remaining / $Speed
-
-            $ETA =
-                [TimeSpan]::FromSeconds($ETASeconds)
-
-            $ETAString =
-                $ETA.ToString("hh\:mm\:ss")
-
-        }
-        else {
-
-            $ETAString = "--:--:--"
-        }
-
-
-        Write-Progress `
-            -Activity "SHA-256 duplicate check" `
-            -Status "$Percent% | $ProcessedCandidates / $CandidateFiles | Duplicates: $DuplicatesFound | Speed: $Speed files/sec | ETA: $ETAString" `
-            -PercentComplete $Percent
-
-
-        # ----------------------------------------------------
-        # Check file
-        # ----------------------------------------------------
-
-        if (
-            -not (
-                Test-Path `
-                    -LiteralPath $Path `
-                    -PathType Leaf
-            )
-        ) {
-
-            $HashErrors++
-            continue
-        }
-
-
-        # ----------------------------------------------------
-        # SHA-256
-        # ----------------------------------------------------
-
-        $Hash =
-            Get-FileHashSafe -Path $Path
-
-
-        if ($null -eq $Hash) {
-
-            $HashErrors++
-            continue
-        }
-
-
-        # ----------------------------------------------------
-        # First file with this hash
-        # ----------------------------------------------------
-
-        if (-not $HashMap.ContainsKey($Hash)) {
-
-            $HashMap[$Hash] = $Path
-
-            continue
-        }
-
-
-        # ====================================================
-        # TRUE DUPLICATE
-        # ====================================================
-
-        $KeptFile =
-            $HashMap[$Hash]
-
-
-        $DuplicatesFound++
-
-
-        # ----------------------------------------------------
-        # Log information
-        # ----------------------------------------------------
-
-        $Action = "WOULD_DELETE"
-
-
-        if (-not $DryRun) {
-
-            try {
-
-                Remove-Item `
-                    -LiteralPath $Path `
-                    -Force `
-                    -ErrorAction Stop
-
-                $Action = "DELETED"
-
-                $FilesDeleted++
-                $BytesFreed += $FileSize
+                $Speed = [math]::Round(
+                    $ProcessedCandidates /
+                    $Elapsed.TotalSeconds,
+                    1
+                )
 
             }
-            catch {
+            else {
 
-                $Action = "DELETE_FAILED"
-                $DeleteErrors++
+                $Speed = 0
+            }
 
+
+            if ($Speed -gt 0) {
+
+                $Remaining =
+                    $CandidateFiles -
+                    $ProcessedCandidates
+
+                $ETASeconds =
+                    $Remaining / $Speed
+
+                $ETA =
+                    [TimeSpan]::FromSeconds(
+                        $ETASeconds
+                    )
+
+                $ETAString =
+                    $ETA.ToString("hh\:mm\:ss")
+
+            }
+            else {
+
+                $ETAString = "--:--:--"
+            }
+
+
+            Write-Progress `
+                -Activity "SHA-256 duplicate check" `
+                -Status "$Percent% | $ProcessedCandidates / $CandidateFiles | Duplicates: $DuplicatesFound | Speed: $Speed files/sec | ETA: $ETAString" `
+                -PercentComplete $Percent
+
+
+            # ------------------------------------------------
+            # Verify file still exists
+            # ------------------------------------------------
+
+            if (
+                -not (
+                    Test-Path `
+                        -LiteralPath $Path `
+                        -PathType Leaf
+                )
+            ) {
+
+                $HashErrors++
+                continue
+            }
+
+
+            # ------------------------------------------------
+            # SHA-256
+            # ------------------------------------------------
+
+            $Hash =
+                Get-FileHashSafe -Path $Path
+
+
+            if ($null -eq $Hash) {
+
+                $HashErrors++
+                continue
+            }
+
+
+            # ------------------------------------------------
+            # First file with this hash
+            # ------------------------------------------------
+
+            if (-not $HashMap.ContainsKey($Hash)) {
+
+                $HashMap[$Hash] = $Path
+                continue
+            }
+
+
+            # =================================================
+            # TRUE DUPLICATE
+            # =================================================
+
+            $KeptFile =
+                $HashMap[$Hash]
+
+
+            $DuplicatesFound++
+
+
+            # ------------------------------------------------
+            # Default action
+            # ------------------------------------------------
+
+            $Action = "WOULD_DELETE"
+
+
+            # ------------------------------------------------
+            # Delete duplicate
+            # ------------------------------------------------
+
+            if (-not $DryRun) {
+
+                try {
+
+                    Remove-Item `
+                        -LiteralPath $Path `
+                        -Force `
+                        -ErrorAction Stop
+
+
+                    $Action = "DELETED"
+
+                    $FilesDeleted++
+                    $BytesFreed += $FileSize
+
+                }
+                catch {
+
+                    $Action = "DELETE_FAILED"
+                    $DeleteErrors++
+                }
+            }
+
+
+            # ------------------------------------------------
+            # Console output for every duplicate
+            # ------------------------------------------------
+
+            Write-Host ""
+            Write-Host "Duplicate found:" `
+                -ForegroundColor Yellow
+
+            Write-Host "  Duplicate : $Path"
+            Write-Host "  Keeping   : $KeptFile"
+            Write-Host "  Size      : $(Format-Size $FileSize)"
+            Write-Host "  SHA-256   : $Hash"
+            Write-Host "  Action    : $Action" `
+                -ForegroundColor $(
+                    if ($Action -eq "DELETED") {
+                        "Green"
+                    }
+                    elseif ($Action -eq "DELETE_FAILED") {
+                        "Red"
+                    }
+                    else {
+                        "Yellow"
+                    }
+                )
+
+
+            # ------------------------------------------------
+            # CSV LOG
+            # ------------------------------------------------
+
+            $LogEntry = [PSCustomObject]@{
+
+                Timestamp =
+                    (Get-Date).ToString(
+                        "yyyy-MM-dd HH:mm:ss"
+                    )
+
+                Action =
+                    $Action
+
+                DuplicateFile =
+                    $Path
+
+                KeptFile =
+                    $KeptFile
+
+                SizeBytes =
+                    $FileSize
+
+                Size =
+                    Format-Size $FileSize
+
+                SHA256 =
+                    $Hash
+            }
+
+
+            if (-not (Test-Path -LiteralPath $LogFile)) {
+
+                $LogEntry |
+                    Export-Csv `
+                        -LiteralPath $LogFile `
+                        -NoTypeInformation `
+                        -Encoding UTF8
+            }
+            else {
+
+                $LogEntry |
+                    Export-Csv `
+                        -LiteralPath $LogFile `
+                        -NoTypeInformation `
+                        -Append `
+                        -Encoding UTF8
             }
         }
 
-
-        # ----------------------------------------------------
-        # CSV LOG
-        # ----------------------------------------------------
-
-        $LogEntry = [PSCustomObject]@{
-
-            Timestamp     = (Get-Date).ToString(
-                "yyyy-MM-dd HH:mm:ss"
-            )
-
-            Action        = $Action
-
-            DuplicateFile = $Path
-
-            KeptFile      = $KeptFile
-
-            SizeBytes     = $FileSize
-
-            Size          = Format-Size $FileSize
-
-            SHA256        = $Hash
-        }
-
-
-        if (-not (Test-Path -LiteralPath $LogFile)) {
-
-            $LogEntry |
-                Export-Csv `
-                    -LiteralPath $LogFile `
-                    -NoTypeInformation `
-                    -Encoding UTF8
-
-        }
-        else {
-
-            $LogEntry |
-                Export-Csv `
-                    -LiteralPath $LogFile `
-                    -NoTypeInformation `
-                    -Append `
-                    -Encoding UTF8
-        }
     }
+    finally {
 
-}
-finally {
-
-    $Reader.Dispose()
-    $HashMap.Clear()
+        $Reader.Dispose()
+        $HashMap.Clear()
+    }
 }
 
 
@@ -871,16 +992,20 @@ Write-Progress `
 
 
 Write-Host ""
-Write-Host "Duplicate check complete." -ForegroundColor Green
+Write-Host "Duplicate check complete." `
+    -ForegroundColor Green
+
 Write-Host ""
 
 
 # ============================================================
 # STEP 4
-# FINAL VERIFICATION SCAN
+# FINAL VERIFICATION
 # ============================================================
 
-Write-Host "[4/4] Verifying final folder status..." -ForegroundColor Yellow
+Write-Host "[4/4] Verifying final folder status..." `
+    -ForegroundColor Yellow
+
 Write-Host ""
 
 
@@ -892,56 +1017,64 @@ $FinalScanStart = Get-Date
 $LastUpdate = $FinalScanStart
 
 
-Get-ChildItem `
-    -LiteralPath $Folder `
-    -File `
-    -Recurse `
-    -ErrorAction SilentlyContinue |
+try {
 
-ForEach-Object {
+    Get-ChildItem `
+        -LiteralPath $Folder `
+        -File `
+        -Recurse `
+        -ErrorAction SilentlyContinue |
 
-    $File = $_
+    ForEach-Object {
 
-
-    if (Test-IsExcluded $File.FullName) {
-        return
-    }
+        $File = $_
 
 
-    $FilesAfter++
-    $TotalSizeAfter += $File.Length
-
-
-    $Now = Get-Date
-
-
-    if (($Now - $LastUpdate).TotalSeconds -ge 2) {
-
-        $Elapsed =
-            ($Now - $FinalScanStart).TotalSeconds
-
-
-        if ($Elapsed -gt 0) {
-
-            $Speed = [math]::Round(
-                $FilesAfter / $Elapsed,
-                1
-            )
-
-        }
-        else {
-
-            $Speed = 0
+        if (Test-IsExcluded $File.FullName) {
+            return
         }
 
 
-        Write-Host `
-            "`rVerifying: $FilesAfter files | Size: $(Format-Size $TotalSizeAfter) | Speed: $Speed files/sec" `
-            -NoNewline
+        $FilesAfter++
+        $TotalSizeAfter += $File.Length
 
 
-        $LastUpdate = $Now
+        $Now = Get-Date
+
+
+        if (($Now - $LastUpdate).TotalSeconds -ge 2) {
+
+            $Elapsed =
+                ($Now - $FinalScanStart).TotalSeconds
+
+
+            if ($Elapsed -gt 0) {
+
+                $Speed = [math]::Round(
+                    $FilesAfter / $Elapsed,
+                    1
+                )
+
+            }
+            else {
+
+                $Speed = 0
+            }
+
+
+            Write-Host `
+                "`rVerifying: $FilesAfter files | Size: $(Format-Size $TotalSizeAfter) | Speed: $Speed files/sec" `
+                -NoNewline
+
+
+            $LastUpdate = $Now
+        }
     }
+
+}
+catch {
+
+    $FinalScanErrors++
 }
 
 
@@ -974,133 +1107,91 @@ $TotalErrors =
 # FINAL REPORT
 # ============================================================
 
+Write-Section "FINAL REPORT"
+
+
+Write-Host "FILES"
+Write-Host "  Before       : $FilesScanned"
+Write-Host "  Duplicates   : $DuplicatesFound"
+Write-Host "  Deleted      : $FilesDeleted"
+Write-Host "  Remaining    : $FilesAfter"
+
 Write-Host ""
-Write-Host "============================================================" `
-    -ForegroundColor Green
 
-Write-Host "                     FINAL REPORT" `
-    -ForegroundColor Green
-
-Write-Host "============================================================" `
-    -ForegroundColor Green
+Write-Host "STORAGE"
+Write-Host "  Before       : $(Format-Size $TotalSizeBefore)"
+Write-Host "  Freed        : $(Format-Size $ActualFreed)"
+Write-Host "  After        : $(Format-Size $TotalSizeAfter)"
 
 Write-Host ""
 
+Write-Host "DUPLICATES"
+Write-Host "  Candidate groups : $CandidateGroups"
+Write-Host "  Candidate files  : $CandidateFiles"
+Write-Host "  True duplicates  : $DuplicatesFound"
 
-# ------------------------------------------------------------
-# Main summary
-# ------------------------------------------------------------
+Write-Host ""
 
-Write-Host `
-    "FILES    : $FilesScanned before | $FilesDeleted deleted | $FilesAfter remaining" `
-    -ForegroundColor White
-
-
-Write-Host `
-    "SIZE     : $(Format-Size $TotalSizeBefore) before | $(Format-Size $ActualFreed) freed | $(Format-Size $TotalSizeAfter) after" `
-    -ForegroundColor White
-
-
-Write-Host `
-    "DUPLICATE: $DuplicatesFound real | $CandidateFiles candidates | $CandidateGroups size-groups" `
-    -ForegroundColor Yellow
-
-
-Write-Host `
-    "TIME     : $([math]::Round($TotalTime.TotalMinutes, 1)) minutes | Errors: $TotalErrors" `
-    -ForegroundColor White
-
+Write-Host "PERFORMANCE"
+Write-Host "  Total time   : $([math]::Round($TotalTime.TotalMinutes, 1)) minutes"
+Write-Host "  Errors       : $TotalErrors"
 
 Write-Host ""
 
 
-# ------------------------------------------------------------
-# Mode
-# ------------------------------------------------------------
+# ============================================================
+# MODE
+# ============================================================
 
 if ($DryRun) {
 
-    Write-Host `
-        "MODE     : DRY RUN - NOTHING WAS DELETED" `
+    Write-Host "MODE"
+    Write-Host "  DRY RUN - NOTHING WAS DELETED" `
         -ForegroundColor Yellow
 
 }
 else {
 
-    Write-Host `
-        "MODE     : LIVE - DUPLICATES DELETED" `
+    Write-Host "MODE"
+    Write-Host "  LIVE - DUPLICATES WERE DELETED" `
         -ForegroundColor Green
 }
 
 
-# ------------------------------------------------------------
-# Exclusion
-# ------------------------------------------------------------
+Write-Host ""
 
-if ([string]::IsNullOrWhiteSpace($ExcludeFolder)) {
 
-    Write-Host "EXCLUDE  : NONE" -ForegroundColor DarkGray
+# ============================================================
+# LOG
+# ============================================================
+
+if (Test-Path -LiteralPath $LogFile) {
+
+    Write-Host "LOG"
+    Write-Host "  $LogFile" `
+        -ForegroundColor Cyan
 
 }
 else {
 
-    Write-Host `
-        "EXCLUDE  : $ExcludeFolder" `
-        -ForegroundColor Yellow
+    Write-Host "LOG"
+    Write-Host "  No duplicate log was created." `
+        -ForegroundColor DarkGray
 }
 
-
-# ------------------------------------------------------------
-# Log
-# ------------------------------------------------------------
-
-if (Test-Path -LiteralPath $LogFile) {
-
-    Write-Host ""
-    Write-Host "LOG      : $LogFile" -ForegroundColor Cyan
-}
-
-
-# ============================================================
-# CLEANUP TEMP FILES
-# ============================================================
 
 Write-Host ""
-Write-Host "Cleaning temporary files..." -ForegroundColor DarkGray
 
 
-Remove-Item `
-    -LiteralPath $RawIndexFile `
-    -Force `
-    -ErrorAction SilentlyContinue
+# ============================================================
+# CLEANUP
+# ============================================================
+
+Write-Host "Cleaning temporary files..." `
+    -ForegroundColor DarkGray
 
 
-Remove-Item `
-    -LiteralPath $SortedIndexFile `
-    -Force `
-    -ErrorAction SilentlyContinue
-
-
-# Remove temp directory if empty
-try {
-
-    if (
-        (Get-ChildItem `
-            -LiteralPath $TempDirectory `
-            -Force `
-            -ErrorAction SilentlyContinue).Count -eq 0
-    ) {
-
-        Remove-Item `
-            -LiteralPath $TempDirectory `
-            -Force `
-            -ErrorAction SilentlyContinue
-    }
-
-}
-catch {
-    # Temporary directory cleanup failure is non-fatal.
-}
+Remove-TemporaryFiles
 
 
 # ============================================================
@@ -1108,6 +1199,7 @@ catch {
 # ============================================================
 
 Write-Host ""
+
 Write-Host "============================================================" `
     -ForegroundColor Green
 
@@ -1118,3 +1210,6 @@ Write-Host "============================================================" `
     -ForegroundColor Green
 
 Write-Host ""
+
+
+Read-Host "Press ENTER to exit"
