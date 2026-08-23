@@ -1,0 +1,13 @@
+# PowerShell temporary files
+*.tmp
+
+# Generated duplicate deletion logs
+duplicate-deletion-log.csv
+
+# Windows
+Thumbs.db
+Desktop.ini
+
+# Editor files
+.vscode/
+.idea/
