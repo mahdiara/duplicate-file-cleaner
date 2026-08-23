@@ -1,141 +1,121 @@
-````markdown
 # Duplicate File Cleaner
 
-A lightweight PowerShell tool for finding and removing duplicate files on Windows.
+A simple, low-RAM PowerShell tool for finding true duplicate files on Windows.
 
-It finds duplicates using **file size + SHA-256**, so files are never deleted just because they have the same name or size.
+It first groups files by size, then uses **SHA-256** to verify whether same-size files are actually identical. Only confirmed duplicates can be deleted.
 
 ## Features
 
-- Recursive folder scanning
-- Low RAM usage
-- SHA-256 duplicate verification
-- Exclude folders
-- Dry Run mode
-- Live progress and ETA
-- CSV deletion log
-- Supports large file collections, including 1TB+
-- No third-party software required
-
-## How It Works
-
-```text
-File Size
-   ↓
-Same Size?
-   ↓
-SHA-256
-   ↓
-Same Hash?
-   ↓
-Duplicate → Keep one, delete the other
-````
-
-Two files with the same size but different contents are **not** considered duplicates.
-
-## Requirements
-
-* Windows 10+
-* PowerShell 5.1+
+* Recursive file scanning
+* Low RAM usage
+* Disk-backed file indexing
+* SHA-256 verification
+* Safe `Dry Run` mode
+* Live progress, speed and ETA
+* Console duplicate reports
+* CSV deletion log
+* Folder exclusion support
+* Final verification report
+* Designed for large file collections
 
 ## Usage
 
-Open `DuplicateCleaner.ps1` and configure:
+Edit these settings in `DuplicateCleaner.ps1`:
 
 ```powershell
-$Folder = "D:\MyFiles"
-
+$Folder = "D:\Your\Folder"
 $ExcludeFolder = ""
-
 $DryRun = $true
 ```
 
-### Settings
+### Safe Mode
 
-**Folder**
-
-The main folder to scan.
-
-**ExcludeFolder**
-
-A folder and all of its subfolders to ignore.
-
-Leave it empty to disable:
-
-```powershell
-$ExcludeFolder = ""
-```
-
-**DryRun**
-
-Run safely without deleting anything:
+Keep:
 
 ```powershell
 $DryRun = $true
 ```
 
-After reviewing the results and deletion log, enable deletion:
+The script will find and report duplicates without deleting anything.
+
+After reviewing the results, change it to:
 
 ```powershell
 $DryRun = $false
 ```
 
-## Run
+to enable deletion.
 
-Open PowerShell and run:
+### Run
+
+Open PowerShell in the project folder and run:
 
 ```powershell
 Set-ExecutionPolicy -Scope Process Bypass
-```
-
-Then:
-
-```powershell
-cd "C:\Path\To\duplicate-file-cleaner"
 .\DuplicateCleaner.ps1
 ```
 
-## Report
+The final report is displayed directly in PowerShell.
 
-The script shows a compact final report:
+> Always run the script in `Dry Run` mode first.
 
-```text
-FILES    : 96455 before | 1091 deleted | 95364 remaining
-SIZE     : 197.37 GB before | 129.03 GB freed | 68.34 GB after
-DUPLICATE: 1091 real | 12746 candidates | 4821 size-groups
-TIME     : 11.7 minutes | Errors: 0
+---
+
+# پاک‌کننده فایل‌های تکراری
+
+یک ابزار ساده و کم‌مصرف PowerShell برای پیدا کردن فایل‌های تکراری واقعی در ویندوز.
+
+اسکریپت ابتدا فایل‌ها را بر اساس حجم دسته‌بندی می‌کند و سپس برای فایل‌های هم‌حجم از **SHA-256** استفاده می‌کند تا مطمئن شود فایل‌ها واقعاً یکسان هستند. فقط Duplicateهای تأییدشده امکان حذف دارند.
+
+## قابلیت‌ها
+
+* اسکن فایل‌ها و زیرپوشه‌ها
+* مصرف پایین RAM
+* ذخیره Index روی دیسک
+* بررسی با SHA-256
+* حالت امن `Dry Run`
+* نمایش پیشرفت، سرعت و زمان باقی‌مانده
+* نمایش Duplicateها در PowerShell
+* ذخیره لاگ حذف‌ها در CSV
+* امکان مستثنی کردن پوشه‌ها
+* گزارش نهایی و بررسی مجدد
+* مناسب برای مجموعه‌های بزرگ فایل
+
+## استفاده
+
+این تنظیمات را در فایل `DuplicateCleaner.ps1` تغییر دهید:
+
+```powershell
+$Folder = "D:\Your\Folder"
+$ExcludeFolder = ""
+$DryRun = $true
 ```
 
-## Deletion Log
+### حالت امن
 
-A `duplicate-deletion-log.csv` file records every duplicate:
-
-* Deleted file
-* Kept file
-* File size
-* SHA-256 hash
-* Timestamp
-* Action
-
-## Safety
-
-Always run with:
+به‌صورت پیش‌فرض:
 
 ```powershell
 $DryRun = $true
 ```
 
-first.
+اسکریپت Duplicateها را پیدا و گزارش می‌کند، اما هیچ فایلی را حذف نمی‌کند.
 
-Review the results and log before enabling deletion.
+بعد از بررسی نتیجه، برای فعال کردن حذف فایل‌ها:
 
-> **Warning:** Live deletion permanently removes files. Keep a backup of important data.
-
-## License
-
-MIT License
-
+```powershell
+$DryRun = $false
 ```
 
-این نسخه برای صفحه اول GitHub مناسب‌تر است. جزئیات فنی اضافه را هم می‌توانیم بعداً داخل `docs/` ببریم تا README شلوغ نشود.
+### اجرا
+
+PowerShell را در پوشه پروژه باز کنید و اجرا کنید:
+
+```powershell
+Set-ExecutionPolicy -Scope Process Bypass
+.\DuplicateCleaner.ps1
 ```
+
+گزارش نهایی مستقیماً داخل PowerShell نمایش داده می‌شود.
+
+> قبل از حذف واقعی، همیشه ابتدا اسکریپت را در حالت `Dry Run` اجرا کنید.
