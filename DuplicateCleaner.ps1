@@ -9,26 +9,31 @@
         1. Files must have the same size.
         2. Files must have the same SHA-256 hash.
 
-    The script uses a disk-backed index instead of keeping the
-    complete file list in RAM. This makes it suitable for very
-    large collections, including 1TB+ datasets.
+    The script uses a disk-backed external merge sort.
+    It does NOT use Windows sort.exe and does not keep
+    the complete file list in RAM.
 
-    Features:
-        - Recursive scanning
-        - Very low RAM usage
-        - Disk-backed indexing
-        - SHA-256 verification
-        - Optional excluded folder
-        - Safe dry-run mode
-        - Live progress
-        - Speed and ETA
-        - CSV deletion log
-        - Final verification
-        - Error handling
-        - Automatic temporary-file cleanup
+    Designed for very large collections, including 1TB+
+    datasets and hundreds of thousands of files.
+
+.FEATURES
+    - Recursive scanning
+    - Very low RAM usage
+    - Disk-backed indexing
+    - External merge sort
+    - SHA-256 verification
+    - Optional excluded folder
+    - Safe dry-run mode
+    - Live progress
+    - Speed and ETA
+    - Console duplicate report
+    - CSV deletion log
+    - Final verification
+    - Error handling
+    - Automatic temporary-file cleanup
 
 .NOTES
-    Version : 1.1.0
+    Version : 2.0.0
     Platform: Windows PowerShell 5.1+ / PowerShell 7+
 #>
 
@@ -60,9 +65,18 @@ $DryRun = $true
 
 
 # ------------------------------------------------------------
+# SORT MEMORY
+# ------------------------------------------------------------
+# Number of index lines kept in RAM during each sort chunk.
+#
+# 50,000 lines keeps RAM usage low even with long file paths.
+
+$SortChunkSize = 50000
+
+
+# ------------------------------------------------------------
 # LOG FILE
 # ------------------------------------------------------------
-# Created next to this script only if duplicates are found.
 
 $LogFile = Join-Path `
     $PSScriptRoot `
@@ -182,14 +196,384 @@ function Write-Section {
 
 
 # ============================================================
+# CREATE SORTED CHUNKS
+# ============================================================
+
+function New-SortedChunks {
+
+    param (
+        [string]$InputFile,
+        [string]$OutputDirectory,
+        [int]$ChunkSize
+    )
+
+
+    $Reader = New-Object `
+        System.IO.StreamReader(
+            $InputFile,
+            [System.Text.Encoding]::UTF8,
+            $true
+        )
+
+
+    $ChunkNumber = 0
+    $Lines = New-Object System.Collections.Generic.List[string]
+
+
+    try {
+
+        while (($Line = $Reader.ReadLine()) -ne $null) {
+
+            if ($Line.Length -lt 21) {
+                continue
+            }
+
+            $Lines.Add($Line)
+
+
+            if ($Lines.Count -ge $ChunkSize) {
+
+                $ChunkNumber++
+
+
+                $ChunkFile = Join-Path `
+                    $OutputDirectory `
+                    ("chunk-{0:D6}.txt" -f $ChunkNumber)
+
+
+                # Sort only this small chunk in RAM.
+                $Lines.Sort()
+
+
+                $Writer = New-Object `
+                    System.IO.StreamWriter(
+                        $ChunkFile,
+                        $false,
+                        [System.Text.UTF8Encoding]::new($false)
+                    )
+
+
+                try {
+
+                    foreach ($Item in $Lines) {
+                        $Writer.WriteLine($Item)
+                    }
+
+                }
+                finally {
+
+                    $Writer.Flush()
+                    $Writer.Dispose()
+                }
+
+
+                $Lines.Clear()
+            }
+        }
+
+
+        # Write remaining lines.
+
+        if ($Lines.Count -gt 0) {
+
+            $ChunkNumber++
+
+
+            $ChunkFile = Join-Path `
+                $OutputDirectory `
+                ("chunk-{0:D6}.txt" -f $ChunkNumber)
+
+
+            $Lines.Sort()
+
+
+            $Writer = New-Object `
+                System.IO.StreamWriter(
+                    $ChunkFile,
+                    $false,
+                    [System.Text.UTF8Encoding]::new($false)
+                )
+
+
+            try {
+
+                foreach ($Item in $Lines) {
+                    $Writer.WriteLine($Item)
+                }
+
+            }
+            finally {
+
+                $Writer.Flush()
+                $Writer.Dispose()
+            }
+
+
+            $Lines.Clear()
+        }
+
+    }
+    finally {
+
+        $Reader.Dispose()
+    }
+
+
+    return $ChunkNumber
+}
+
+
+# ============================================================
+# MERGE TWO SORTED FILES
+# ============================================================
+
+function Merge-TwoSortedFiles {
+
+    param (
+        [string]$FileA,
+        [string]$FileB,
+        [string]$OutputFile
+    )
+
+
+    $ReaderA = New-Object `
+        System.IO.StreamReader(
+            $FileA,
+            [System.Text.Encoding]::UTF8,
+            $true
+        )
+
+
+    $ReaderB = New-Object `
+        System.IO.StreamReader(
+            $FileB,
+            [System.Text.Encoding]::UTF8,
+            $true
+        )
+
+
+    $Writer = New-Object `
+        System.IO.StreamWriter(
+            $OutputFile,
+            $false,
+            [System.Text.UTF8Encoding]::new($false)
+        )
+
+
+    try {
+
+        $LineA = $ReaderA.ReadLine()
+        $LineB = $ReaderB.ReadLine()
+
+
+        while (
+            $null -ne $LineA -or
+            $null -ne $LineB
+        ) {
+
+            if ($null -eq $LineA) {
+
+                $Writer.WriteLine($LineB)
+                $LineB = $ReaderB.ReadLine()
+
+            }
+            elseif ($null -eq $LineB) {
+
+                $Writer.WriteLine($LineA)
+                $LineA = $ReaderA.ReadLine()
+
+            }
+            elseif ([string]::CompareOrdinal($LineA, $LineB) -le 0) {
+
+                $Writer.WriteLine($LineA)
+                $LineA = $ReaderA.ReadLine()
+
+            }
+            else {
+
+                $Writer.WriteLine($LineB)
+                $LineB = $ReaderB.ReadLine()
+            }
+        }
+
+    }
+    finally {
+
+        $Writer.Flush()
+        $Writer.Dispose()
+
+        $ReaderA.Dispose()
+        $ReaderB.Dispose()
+    }
+}
+
+
+# ============================================================
+# MERGE ALL SORTED CHUNKS
+# ============================================================
+
+function Merge-AllSortedChunks {
+
+    param (
+        [string]$ChunkDirectory,
+        [string]$FinalOutput
+    )
+
+
+    $Files = @(
+        Get-ChildItem `
+            -LiteralPath $ChunkDirectory `
+            -Filter "chunk-*.txt" `
+            -File `
+            -ErrorAction SilentlyContinue |
+        Sort-Object Name
+    )
+
+
+    if ($Files.Count -eq 0) {
+        return $false
+    }
+
+
+    $Round = 0
+
+
+    while ($Files.Count -gt 1) {
+
+        $Round++
+
+        $NextFiles = New-Object System.Collections.Generic.List[string]
+
+
+        for (
+            $i = 0;
+            $i -lt $Files.Count;
+            $i += 2
+        ) {
+
+            $FileA = $Files[$i].FullName
+
+
+            # If there is no pair, carry the file forward.
+
+            if (($i + 1) -ge $Files.Count) {
+
+                $NextFiles.Add($FileA)
+                continue
+            }
+
+
+            $FileB = $Files[$i + 1].FullName
+
+
+            $MergedFile = Join-Path `
+                $ChunkDirectory `
+                ("merge-{0:D4}-{1:D6}.txt" -f $Round, ($i / 2))
+
+
+            Merge-TwoSortedFiles `
+                -FileA $FileA `
+                -FileB $FileB `
+                -OutputFile $MergedFile
+
+
+            Remove-Item `
+                -LiteralPath $FileA `
+                -Force `
+                -ErrorAction SilentlyContinue
+
+            Remove-Item `
+                -LiteralPath $FileB `
+                -Force `
+                -ErrorAction SilentlyContinue
+
+
+            $NextFiles.Add($MergedFile)
+        }
+
+
+        $Files = @(
+            $NextFiles |
+            ForEach-Object {
+                Get-Item `
+                    -LiteralPath $_ `
+                    -ErrorAction SilentlyContinue
+            }
+        )
+    }
+
+
+    Move-Item `
+        -LiteralPath $Files[0].FullName `
+        -Destination $FinalOutput `
+        -Force
+
+
+    return $true
+}
+
+
+# ============================================================
+# CLEANUP FUNCTION
+# ============================================================
+
+function Remove-TemporaryFiles {
+
+    if (
+        Test-Path `
+            -LiteralPath $TempDirectory `
+            -PathType Container
+    ) {
+
+        try {
+
+            Get-ChildItem `
+                -LiteralPath $TempDirectory `
+                -Force `
+                -ErrorAction SilentlyContinue |
+            Remove-Item `
+                -Force `
+                -Recurse `
+                -ErrorAction SilentlyContinue
+
+        }
+        catch {
+            # Cleanup failure is non-fatal.
+        }
+
+
+        try {
+
+            Remove-Item `
+                -LiteralPath $TempDirectory `
+                -Force `
+                -ErrorAction SilentlyContinue
+
+        }
+        catch {
+            # Cleanup failure is non-fatal.
+        }
+    }
+}
+
+
+# ============================================================
 # VALIDATION
 # ============================================================
 
-if (-not (Test-Path -LiteralPath $Folder -PathType Container)) {
+if ([string]::IsNullOrWhiteSpace($Folder)) {
 
     Write-Host ""
-    Write-Host "ERROR: Main folder does not exist." -ForegroundColor Red
-    Write-Host $Folder -ForegroundColor Red
+    Write-Host "ERROR: Please set the `$Folder variable first." `
+        -ForegroundColor Red
+
+    Write-Host ""
+    Write-Host 'Example:' `
+        -ForegroundColor Yellow
+
+    Write-Host '$Folder = "D:\MyFiles"' `
+        -ForegroundColor Yellow
+
     Write-Host ""
 
     Read-Host "Press ENTER to exit"
@@ -197,11 +581,40 @@ if (-not (Test-Path -LiteralPath $Folder -PathType Container)) {
 }
 
 
-$Folder = (
-    Resolve-Path `
-        -LiteralPath $Folder `
-        -ErrorAction Stop
-).Path
+if (-not (Test-Path -LiteralPath $Folder -PathType Container)) {
+
+    Write-Host ""
+    Write-Host "ERROR: Main folder does not exist." `
+        -ForegroundColor Red
+
+    Write-Host $Folder `
+        -ForegroundColor Red
+
+    Write-Host ""
+
+    Read-Host "Press ENTER to exit"
+    exit 1
+}
+
+
+try {
+
+    $Folder = (
+        Resolve-Path `
+            -LiteralPath $Folder `
+            -ErrorAction Stop
+    ).Path
+
+}
+catch {
+
+    Write-Host ""
+    Write-Host "ERROR: Could not resolve main folder." `
+        -ForegroundColor Red
+
+    Read-Host "Press ENTER to exit"
+    exit 1
+}
 
 
 # ------------------------------------------------------------
@@ -222,12 +635,15 @@ if (-not [string]::IsNullOrWhiteSpace($ExcludeFolder)) {
         Write-Host "ERROR: Excluded folder does not exist." `
             -ForegroundColor Red
 
-        Write-Host $ExcludeFolder -ForegroundColor Red
+        Write-Host $ExcludeFolder `
+            -ForegroundColor Red
+
         Write-Host ""
 
         Read-Host "Press ENTER to exit"
         exit 1
     }
+
 
     $ExcludeFolder = (
         Resolve-Path `
@@ -237,85 +653,50 @@ if (-not [string]::IsNullOrWhiteSpace($ExcludeFolder)) {
 }
 
 
-# ------------------------------------------------------------
-# Check sort.exe
-# ------------------------------------------------------------
-
-$SortExe = Join-Path `
-    $env:SystemRoot `
-    "System32\sort.exe"
-
-
-if (-not (Test-Path -LiteralPath $SortExe)) {
-
-    Write-Host ""
-    Write-Host "ERROR: Windows sort.exe was not found." `
-        -ForegroundColor Red
-
-    Write-Host ""
-
-    Read-Host "Press ENTER to exit"
-    exit 1
-}
-
-
 # ============================================================
-# TEMP FILES
+# TEMP DIRECTORY
 # ============================================================
 
 $RunId = [Guid]::NewGuid().ToString("N")
 
-$RawIndexFile = Join-Path `
+$RunDirectory = Join-Path `
     $TempDirectory `
-    "index-$RunId.txt"
+    $RunId
+
+$RawIndexFile = Join-Path `
+    $RunDirectory `
+    "index.txt"
 
 $SortedIndexFile = Join-Path `
-    $TempDirectory `
-    "sorted-$RunId.txt"
+    $RunDirectory `
+    "sorted-index.txt"
+
+$ChunkDirectory = Join-Path `
+    $RunDirectory `
+    "chunks"
 
 
-# ============================================================
-# CLEANUP FUNCTION
-# ============================================================
+try {
 
-function Remove-TemporaryFiles {
-
-    Remove-Item `
-        -LiteralPath $RawIndexFile `
+    New-Item `
+        -ItemType Directory `
+        -Path $ChunkDirectory `
         -Force `
-        -ErrorAction SilentlyContinue
+        -ErrorAction Stop |
+        Out-Null
 
-    Remove-Item `
-        -LiteralPath $SortedIndexFile `
-        -Force `
-        -ErrorAction SilentlyContinue
+}
+catch {
 
-    try {
+    Write-Host ""
+    Write-Host "ERROR: Could not create temporary directory." `
+        -ForegroundColor Red
 
-        if (
-            Test-Path `
-                -LiteralPath $TempDirectory `
-                -PathType Container
-        ) {
+    Write-Host $_.Exception.Message `
+        -ForegroundColor Red
 
-            $Remaining =
-                Get-ChildItem `
-                    -LiteralPath $TempDirectory `
-                    -Force `
-                    -ErrorAction SilentlyContinue
-
-            if ($null -eq $Remaining) {
-
-                Remove-Item `
-                    -LiteralPath $TempDirectory `
-                    -Force `
-                    -ErrorAction SilentlyContinue
-            }
-        }
-    }
-    catch {
-        # Cleanup failure is non-fatal.
-    }
+    Read-Host "Press ENTER to exit"
+    exit 1
 }
 
 
@@ -333,9 +714,11 @@ Write-Section "DUPLICATE FILE CLEANER"
 
 Write-Host "Main folder : $Folder"
 
+
 if ([string]::IsNullOrWhiteSpace($ExcludeFolder)) {
 
-    Write-Host "Excluded    : NONE" -ForegroundColor DarkGray
+    Write-Host "Excluded    : NONE" `
+        -ForegroundColor DarkGray
 
 }
 else {
@@ -357,6 +740,7 @@ else {
         -ForegroundColor Red
 }
 
+
 Write-Host ""
 
 
@@ -369,31 +753,6 @@ $TotalSizeBefore = [Int64]0
 
 $ExcludedFiles = 0
 $ScanErrors = 0
-
-
-# ============================================================
-# CREATE TEMP DIRECTORY
-# ============================================================
-
-try {
-
-    New-Item `
-        -ItemType Directory `
-        -Path $TempDirectory `
-        -Force `
-        -ErrorAction Stop |
-        Out-Null
-
-}
-catch {
-
-    Write-Host ""
-    Write-Host "ERROR: Could not create temporary directory." `
-        -ForegroundColor Red
-
-    Read-Host "Press ENTER to exit"
-    exit 1
-}
 
 
 # ============================================================
@@ -414,15 +773,18 @@ $ScanStart = Get-Date
 $LastUpdate = $ScanStart
 
 
-$Writer = New-Object `
-    System.IO.StreamWriter(
-        $RawIndexFile,
-        $false,
-        [System.Text.UTF8Encoding]::new($false)
-    )
+$Writer = $null
 
 
 try {
+
+    $Writer = New-Object `
+        System.IO.StreamWriter(
+            $RawIndexFile,
+            $false,
+            [System.Text.UTF8Encoding]::new($false)
+        )
+
 
     Get-ChildItem `
         -LiteralPath $Folder `
@@ -446,10 +808,7 @@ try {
         $TotalSizeBefore += $File.Length
 
 
-        # Fixed-width 20-digit size prefix.
-        #
-        # Example:
-        # 00000000000052428800    D:\folder\file.mp4
+        # 20-digit fixed-width size + TAB + path
 
         $Line = "{0:D20}`t{1}" -f `
             $File.Length,
@@ -462,6 +821,7 @@ try {
         # Live status every 2 seconds
 
         $Now = Get-Date
+
 
         if (($Now - $LastUpdate).TotalSeconds -ge 2) {
 
@@ -497,21 +857,29 @@ catch {
 
     $ScanErrors++
 
+
     Write-Host ""
     Write-Host ""
     Write-Host "WARNING: Error while scanning files." `
         -ForegroundColor Yellow
-}
 
+    Write-Host $_.Exception.Message `
+        -ForegroundColor Yellow
+
+}
 finally {
 
-    $Writer.Flush()
-    $Writer.Dispose()
+    if ($null -ne $Writer) {
+
+        $Writer.Flush()
+        $Writer.Dispose()
+    }
 }
 
 
 Write-Host ""
 Write-Host ""
+
 
 Write-Host "Scan complete." `
     -ForegroundColor Green
@@ -528,13 +896,16 @@ Write-Host ""
 
 # ============================================================
 # STEP 2
-# SORT INDEX
+# EXTERNAL MERGE SORT
 # ============================================================
 
 Write-Host "[2/4] Sorting size index..." `
     -ForegroundColor Yellow
 
-Write-Host "      Sorting is performed on disk." `
+Write-Host "      Using disk-backed external merge sort." `
+    -ForegroundColor DarkGray
+
+Write-Host "      RAM chunk size: $SortChunkSize files" `
     -ForegroundColor DarkGray
 
 Write-Host ""
@@ -543,24 +914,102 @@ Write-Host ""
 $SortStart = Get-Date
 
 
-& $SortExe `
-    $RawIndexFile `
-    /O $SortedIndexFile `
-    /REC 65535 `
-    2>$null
+try {
+
+    # --------------------------------------------------------
+    # Create individually sorted chunks
+    # --------------------------------------------------------
+
+    Write-Host "      Creating sorted chunks..." `
+        -ForegroundColor DarkGray
 
 
-$SortExitCode = $LASTEXITCODE
+    $ChunkCount = New-SortedChunks `
+        -InputFile $RawIndexFile `
+        -OutputDirectory $ChunkDirectory `
+        -ChunkSize $SortChunkSize
 
 
-if ($SortExitCode -ne 0) {
+    if ($ChunkCount -eq 0) {
+
+        Write-Host ""
+        Write-Host "No files were indexed." `
+            -ForegroundColor Yellow
+
+        Remove-TemporaryFiles
+
+        Read-Host "Press ENTER to exit"
+        exit 0
+    }
+
+
+    Write-Host "      Created $ChunkCount sorted chunk(s)." `
+        -ForegroundColor DarkGray
+
+
+    # --------------------------------------------------------
+    # Merge chunks
+    # --------------------------------------------------------
+
+    Write-Host "      Merging sorted chunks..." `
+        -ForegroundColor DarkGray
+
+
+    $MergeSuccess = Merge-AllSortedChunks `
+        -ChunkDirectory $ChunkDirectory `
+        -FinalOutput $SortedIndexFile
+
+
+    if (-not $MergeSuccess) {
+
+        throw "The sorted index could not be created."
+    }
+
+
+    # --------------------------------------------------------
+    # Verify output
+    # --------------------------------------------------------
+
+    if (
+        -not (
+            Test-Path `
+                -LiteralPath $SortedIndexFile `
+                -PathType Leaf
+        )
+    ) {
+
+        throw "The sorted index file was not created."
+    }
+
+
+    $SortTime =
+        (Get-Date) - $SortStart
+
+
+    Write-Host ""
+    Write-Host "Sort complete." `
+        -ForegroundColor Green
+
+    Write-Host "Sort time: $([math]::Round($SortTime.TotalMinutes, 1)) minutes"
+
+    Write-Host ""
+
+
+}
+catch {
 
     Write-Host ""
     Write-Host "ERROR: Sorting the index failed." `
         -ForegroundColor Red
 
-    Write-Host "Sort exit code: $SortExitCode" `
+    Write-Host ""
+    Write-Host "Reason:" `
+        -ForegroundColor Yellow
+
+    Write-Host $_.Exception.Message `
         -ForegroundColor Red
+
+    Write-Host ""
 
     Remove-TemporaryFiles
 
@@ -569,21 +1018,12 @@ if ($SortExitCode -ne 0) {
 }
 
 
-$SortTime = (Get-Date) - $SortStart
-
+# Raw index is no longer needed.
 
 Remove-Item `
     -LiteralPath $RawIndexFile `
     -Force `
     -ErrorAction SilentlyContinue
-
-
-Write-Host "Sort complete." `
-    -ForegroundColor Green
-
-Write-Host "Sort time: $([math]::Round($SortTime.TotalMinutes, 1)) minutes"
-
-Write-Host ""
 
 
 # ============================================================
@@ -632,17 +1072,19 @@ try {
     $PreviousSize = $null
     $CurrentGroupCount = 0
 
+
     while (($Line = $Reader.ReadLine()) -ne $null) {
 
         if ($Line.Length -lt 21) {
             continue
         }
 
+
         $CurrentSize =
             [Int64]$Line.Substring(0, 20)
 
 
-        if ($PreviousSize -eq $null) {
+        if ($null -eq $PreviousSize) {
 
             $PreviousSize = $CurrentSize
             $CurrentGroupCount = 1
@@ -660,6 +1102,7 @@ try {
                 $CandidateGroups++
                 $CandidateFiles += $CurrentGroupCount
             }
+
 
             $PreviousSize = $CurrentSize
             $CurrentGroupCount = 1
@@ -687,7 +1130,8 @@ Write-Host ""
 
 
 # ------------------------------------------------------------
-# If there are no candidates, skip hashing completely.
+# Second pass:
+# SHA-256 comparison
 # ------------------------------------------------------------
 
 if ($CandidateFiles -eq 0) {
@@ -697,11 +1141,6 @@ if ($CandidateFiles -eq 0) {
 
 }
 else {
-
-    # --------------------------------------------------------
-    # Second pass:
-    # SHA-256 comparison
-    # --------------------------------------------------------
 
     $Reader = New-Object `
         System.IO.StreamReader(
@@ -714,6 +1153,7 @@ else {
     $CurrentSize = $null
 
     # Only one size group exists in memory at a time.
+
     $HashMap = @{}
 
     $HashStart = Get-Date
@@ -731,6 +1171,7 @@ else {
             $FileSize =
                 [Int64]$Line.Substring(0, 20)
 
+
             $Path =
                 $Line.Substring(21)
 
@@ -740,7 +1181,7 @@ else {
             # ------------------------------------------------
 
             if (
-                $CurrentSize -ne $null -and
+                $null -ne $CurrentSize -and
                 $FileSize -ne $CurrentSize
             ) {
 
@@ -758,9 +1199,17 @@ else {
             $ProcessedCandidates++
 
 
-            $Percent = [math]::Floor(
-                ($ProcessedCandidates / $CandidateFiles) * 100
-            )
+            if ($CandidateFiles -gt 0) {
+
+                $Percent = [math]::Floor(
+                    ($ProcessedCandidates / $CandidateFiles) * 100
+                )
+
+            }
+            else {
+
+                $Percent = 100
+            }
 
 
             $Elapsed =
@@ -788,13 +1237,16 @@ else {
                     $CandidateFiles -
                     $ProcessedCandidates
 
+
                 $ETASeconds =
                     $Remaining / $Speed
+
 
                 $ETA =
                     [TimeSpan]::FromSeconds(
                         $ETASeconds
                     )
+
 
                 $ETAString =
                     $ETA.ToString("hh\:mm\:ss")
@@ -834,7 +1286,8 @@ else {
             # ------------------------------------------------
 
             $Hash =
-                Get-FileHashSafe -Path $Path
+                Get-FileHashSafe `
+                    -Path $Path
 
 
             if ($null -eq $Hash) {
@@ -867,15 +1320,11 @@ else {
 
 
             # ------------------------------------------------
-            # Default action
+            # Action
             # ------------------------------------------------
 
             $Action = "WOULD_DELETE"
 
-
-            # ------------------------------------------------
-            # Delete duplicate
-            # ------------------------------------------------
 
             if (-not $DryRun) {
 
@@ -890,22 +1339,25 @@ else {
                     $Action = "DELETED"
 
                     $FilesDeleted++
+
                     $BytesFreed += $FileSize
 
                 }
                 catch {
 
                     $Action = "DELETE_FAILED"
+
                     $DeleteErrors++
                 }
             }
 
 
             # ------------------------------------------------
-            # Console output for every duplicate
+            # Console duplicate report
             # ------------------------------------------------
 
             Write-Host ""
+
             Write-Host "Duplicate found:" `
                 -ForegroundColor Yellow
 
@@ -913,18 +1365,23 @@ else {
             Write-Host "  Keeping   : $KeptFile"
             Write-Host "  Size      : $(Format-Size $FileSize)"
             Write-Host "  SHA-256   : $Hash"
-            Write-Host "  Action    : $Action" `
-                -ForegroundColor $(
-                    if ($Action -eq "DELETED") {
-                        "Green"
-                    }
-                    elseif ($Action -eq "DELETE_FAILED") {
-                        "Red"
-                    }
-                    else {
-                        "Yellow"
-                    }
-                )
+
+
+            if ($Action -eq "DELETED") {
+
+                Write-Host "  Action    : DELETED" `
+                    -ForegroundColor Green
+            }
+            elseif ($Action -eq "DELETE_FAILED") {
+
+                Write-Host "  Action    : DELETE FAILED" `
+                    -ForegroundColor Red
+            }
+            else {
+
+                Write-Host "  Action    : WOULD DELETE" `
+                    -ForegroundColor Yellow
+            }
 
 
             # ------------------------------------------------
@@ -965,6 +1422,7 @@ else {
                         -LiteralPath $LogFile `
                         -NoTypeInformation `
                         -Encoding UTF8
+
             }
             else {
 
@@ -981,6 +1439,7 @@ else {
     finally {
 
         $Reader.Dispose()
+
         $HashMap.Clear()
     }
 }
@@ -1118,6 +1577,7 @@ Write-Host "  Remaining    : $FilesAfter"
 
 Write-Host ""
 
+
 Write-Host "STORAGE"
 Write-Host "  Before       : $(Format-Size $TotalSizeBefore)"
 Write-Host "  Freed        : $(Format-Size $ActualFreed)"
@@ -1125,12 +1585,14 @@ Write-Host "  After        : $(Format-Size $TotalSizeAfter)"
 
 Write-Host ""
 
+
 Write-Host "DUPLICATES"
 Write-Host "  Candidate groups : $CandidateGroups"
 Write-Host "  Candidate files  : $CandidateFiles"
 Write-Host "  True duplicates  : $DuplicatesFound"
 
 Write-Host ""
+
 
 Write-Host "PERFORMANCE"
 Write-Host "  Total time   : $([math]::Round($TotalTime.TotalMinutes, 1)) minutes"
@@ -1143,16 +1605,16 @@ Write-Host ""
 # MODE
 # ============================================================
 
+Write-Host "MODE"
+
 if ($DryRun) {
 
-    Write-Host "MODE"
     Write-Host "  DRY RUN - NOTHING WAS DELETED" `
         -ForegroundColor Yellow
 
 }
 else {
 
-    Write-Host "MODE"
     Write-Host "  LIVE - DUPLICATES WERE DELETED" `
         -ForegroundColor Green
 }
@@ -1165,16 +1627,17 @@ Write-Host ""
 # LOG
 # ============================================================
 
+Write-Host "LOG"
+
+
 if (Test-Path -LiteralPath $LogFile) {
 
-    Write-Host "LOG"
     Write-Host "  $LogFile" `
         -ForegroundColor Cyan
 
 }
 else {
 
-    Write-Host "LOG"
     Write-Host "  No duplicate log was created." `
         -ForegroundColor DarkGray
 }
@@ -1210,6 +1673,5 @@ Write-Host "============================================================" `
     -ForegroundColor Green
 
 Write-Host ""
-
 
 Read-Host "Press ENTER to exit"
